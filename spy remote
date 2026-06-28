@@ -1041,11 +1041,12 @@ local function farmLoop()
             end
 
             -- Attack the closest target: teleport ONTO it, then hit it.
+            -- This always happens regardless of how far the enemy is, so the
+            -- character flies straight to enemies instead of waiting for you
+            -- to walk closer.
             local target = enemies[1]
             local _, hrp = getChar()
             if hrp and target.hrp then
-                -- Teleport right next to the enemy every loop so we never
-                -- get stuck standing in one spot away from them.
                 hrp.CFrame = target.hrp.CFrame * CFrame.new(0, 0, 4)
             end
             task.wait(0.05)
@@ -1059,12 +1060,15 @@ local function farmLoop()
                 hitEnemy(enemies[i].uuid)
             end
         else
-            -- No alive enemies detected.
-            -- INVASION: this means we're on the BOSS (or between waves).
-            -- Do NOT teleport to or fight the boss — just stand still until
-            -- the next raid starts. This prevents the fly-around glitch.
+            -- No enemies detected this instant. This is just a brief gap
+            -- between waves (or the boss hasn't registered as an enemy yet).
+            -- We do NOT teleport anywhere — staying put avoids the fly-around
+            -- glitch — but we keep swinging in place so any enemy that spawns
+            -- right on top of us still takes damage. As soon as getAliveEnemies
+            -- returns a target next loop, we teleport straight to it above.
             if isInvasion then
-                task.wait(0.3)
+                swingWeapon()
+                task.wait(0.25)
                 continue
             end
 
