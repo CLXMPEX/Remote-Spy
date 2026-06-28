@@ -1,9 +1,9 @@
 -- =============================================
---  AUTO FARM GUI v10 — SUNSHINE + DARK MATTER
---  v10 changes (ONLY these, nothing else touched):
---   1. createRaid hardened so Sunshine never freezes on friends/yes
---   2. Invasion uses live dialogue button lookup (works every restart)
---   3. Invasion start is ONE reusable sequence (1st run == Nth run)
+--  AUTO FARM GUI v11 — SUNSHINE + DARK MATTER
+--  v11 changes (ONLY these, nothing else touched):
+--   1. Boss phase: character now stands still — no teleporting to
+--      the boss, no swinging. It just idles until Victory shows up
+--      and the existing victory/raid-cycle logic starts the next run.
 -- =============================================
 
 local Players           = game:GetService("Players")
@@ -310,7 +310,7 @@ local function sendWebhook(title, description, color, extraFields)
             description = description,
             color = color or 5763719,
             fields = fields,
-            footer = { text = "Auto Farm v10" },
+            footer = { text = "Auto Farm v11" },
             timestamp = DateTime.now():ToIsoDate(),
         }}
     }
@@ -1026,22 +1026,16 @@ local function farmLoop()
                 hitEnemy(enemies[i].uuid)
             end
         else
-            -- No alive enemies detected — could be between waves OR the boss
-            -- hasn't registered yet. Sweep the boss area and keep swinging.
-            local bossPos = State.selectedRaid.bossPos
-            if bossPos then
-                local _, hrp = getChar()
-                if hrp then
-                    local dist = (hrp.Position - bossPos.Position).Magnitude
-                    if dist > 12 then
-                        hrp.CFrame = bossPos
-                        task.wait(0.1)
-                    end
-                end
-            end
-            swingWeapon()
-            task.wait(0.1)
-            swingWeapon()
+            -- ============================================================
+            --  v11 FIX: BOSS PHASE — stand still.
+            --  No alive enemies detected means we're either between waves
+            --  or it's boss time. Previously this teleported onto the boss
+            --  and swung automatically; now we just idle here and do
+            --  nothing. victoryLoop still watches for "Victory" and
+            --  raidCycleLoop/victoryLoop handle Replay / restarting the
+            --  next raid exactly as before — only the fighting is removed.
+            -- ============================================================
+            task.wait(0.5)
         end
     end
 end
@@ -1375,7 +1369,7 @@ tt.TextSize = 16; tt.Font = Enum.Font.GothamBold; tt.TextXAlignment = Enum.TextX
 local verBadge = Instance.new("TextLabel", titleBar)
 verBadge.Size = UDim2.new(0, 22, 0, 14); verBadge.Position = UDim2.new(0, 102, 0.5, -7)
 verBadge.BackgroundColor3 = C.accent1; verBadge.BackgroundTransparency = 0.7
-verBadge.Text = "v10"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
+verBadge.Text = "v11"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
 verBadge.TextSize = 9; verBadge.Font = Enum.Font.GothamBold; verBadge.BorderSizePixel = 0; verBadge.ZIndex = 53
 Instance.new("UICorner", verBadge).CornerRadius = UDim.new(0, 4)
 
@@ -1680,8 +1674,7 @@ player.CharacterAdded:Connect(function()
 end)
 
 print("===========================================")
-print("  Auto Farm v10 loaded!")
-print("  Sunshine: hardened Start->Yes (no more freeze)")
-print("  Dark Matter: reliable Lead-me on every restart")
-print("  Invasion start is one reusable sequence")
+print("  Auto Farm v11 loaded!")
+print("  Boss phase: standing still (no auto-fight)")
+print("  Sunshine + Dark Matter raid/invasion cycle intact")
 print("===========================================")
