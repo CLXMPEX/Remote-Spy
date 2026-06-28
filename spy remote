@@ -1205,17 +1205,17 @@ local function victoryLoop()
                     extra
                 )
 
-                print("[AF] Clicking Continue after invasion...")
-                local continued = false
+                print("[AF] Clicking Replay after invasion...")
+                local replayed = false
                 for attempt = 1, 5 do
-                    if clickExact("Continue") then
-                        continued = true
+                    if clickExact("Replay") then
+                        replayed = true
                         break
                     end
                     task.wait(1)
                 end
-                if not continued then
-                    clickByText("continue")
+                if not replayed then
+                    clickByText("replay")
                 end
 
                 task.wait(2)
@@ -1223,7 +1223,7 @@ local function victoryLoop()
                 State.invasionStartAt = 0
                 State.lastModifierSignature = ""
                 State.modifierPickedForSignature = false
-                print("[AF] Invasion continued; returning to bald hero for fresh start.")
+                print("[AF] Invasion replayed.")
 
             else
                 -- Send webhook FIRST (before leaving wipes the screen)
