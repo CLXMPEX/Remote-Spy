@@ -979,14 +979,49 @@ local function isStartInvasionPopupOpen()
     return false
 end
 
+-- Detects the Yes-confirmation popup ("Do you want to start this ... Invasion?"
+-- with a Yes button). Once this shows, Start Invasion has been pressed.
+local function isYesConfirmOpen()
+    for _, obj in ipairs(pgui:GetDescendants()) do
+        if obj:IsA("TextLabel") and obj.Visible then
+            local low = string.lower(obj.Text)
+            if string.find(low, "do you want to start", 1, true) then return true end
+        end
+    end
+    -- Also: a visible button whose text is exactly/contains "yes"
+    for _, obj in ipairs(pgui:GetDescendants()) do
+        if (obj:IsA("TextButton") or obj:IsA("ImageButton")) and obj.Visible then
+            local t = ""
+            pcall(function() t = obj.Text end)
+            if t ~= "" and string.lower(t) == "yes" then return true end
+        end
+    end
+    return false
+end
+
 local function pressStartInvasionThenYes()
-    -- Step 1: press the green "Start Invasion" button.
-    -- Try the connection-fire method AND a real screen tap so whichever the
-    -- game/executor accepts gets through.
-    clickAnyButtonWithText("start invasion")
-    hardClickButtonWithText("start invasion")
-    print("[AF] Pressed Start Invasion (fire + tap)")
-    task.wait(1.2)
+    -- Step 1: press the green "Start Invasion 1x" button.
+    -- Tap it REPEATEDLY (fire + real screen tap) until the Yes-confirmation
+    -- popup appears. A single press can miss after a raid (button not fully
+    -- rendered yet), so we retry just like we do for Yes.
+    local startConfirmed = false
+    for attempt = 1, 6 do
+        if isInRaidArea() then return true end
+        -- If the Yes popup is already showing, Start was pressed — move on.
+        if isYesConfirmOpen() then
+            startConfirmed = true
+            break
+        end
+        clickAnyButtonWithText("start invasion")
+        hardClickButtonWithText("start invasion")
+        print("[AF] Pressed Start Invasion (fire + tap, attempt " .. attempt .. ")")
+        task.wait(1)
+        if isYesConfirmOpen() or isInRaidArea() then
+            startConfirmed = true
+            break
+        end
+        task.wait(0.4)
+    end
 
     -- Step 2: friends-only toggle if requested (optional)
     if State.friendOnly then
@@ -994,9 +1029,7 @@ local function pressStartInvasionThenYes()
         task.wait(0.4)
     end
 
-    -- Step 3: press "Yes" on the confirmation popup. Retry a few times
-    -- because the popup can appear a moment after Start is pressed. Use both
-    -- click methods each attempt.
+    -- Step 3: press "Yes" on the confirmation popup. Retry until in the raid.
     for attempt = 1, 6 do
         if isInRaidArea() then return true end
         clickAnyButtonWithText("yes")
