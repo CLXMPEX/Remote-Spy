@@ -249,8 +249,11 @@ local function sendWebhook(title, description, color)
     end)
 end
 
+
 -- =============================================
 --  UNIVERSAL ENEMY DETECTION
+--  Works for both Sunshine (minions have Humanoid)
+--  and Dark Matter (minions have NO Humanoid, boss HAS Humanoid)
 -- =============================================
 
 local function getAliveEnemies()
@@ -261,17 +264,22 @@ local function getAliveEnemies()
     for _, e in ipairs(folder:GetChildren()) do
         if not e:IsA("Model") then continue end
 
+        -- Must be alive
         local dead = e:GetAttribute("dead")
         if dead ~= false then continue end
 
+        -- Find root part (HumanoidRootPart or Root)
         local hrp = e:FindFirstChild("HumanoidRootPart") or e:FindFirstChild("Root")
         if not hrp then continue end
 
+        -- Must be in raid area
         if hrp.Position.Y < RAID_Y_MIN then continue end
 
+        -- Check humanoid health if it has one
         local hum = e:FindFirstChildOfClass("Humanoid")
         if hum and hum.Health <= 0 then continue end
 
+        -- Get bounds to determine size (bigger = likely boss)
         local bounds = e:GetAttribute("bounds")
         local boundsX = bounds and bounds.X or 0
 
@@ -351,6 +359,7 @@ local function invasionStartTimedOut()
        and (tick() - State.invasionStartAt) >= INVASION_START_TIMEOUT
 end
 
+
 -- =============================================
 --  RAID MANAGEMENT
 -- =============================================
@@ -425,6 +434,7 @@ local function clickByText(searchText)
     return false
 end
 
+-- Click exact text match (for Continue)
 local function clickExact(exactText)
     for _, obj in ipairs(pgui:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Visible and obj.Text == exactText then
@@ -459,6 +469,7 @@ local function createRaid()
         return false
     end
 
+    -- Try clicking the start button in game UI
     print("[AF] Looking for " .. raid.startText .. " button...")
 
     if clickByText(raid.startText) then
@@ -476,6 +487,7 @@ local function createRaid()
         end
     end
 
+    -- Fallback to direct InvokeServer
     print("[AF] Button click failed, trying InvokeServer...")
     if raid.raidType == "invasion" and R.createInvasion then
         local ok, err = pcall(function()
@@ -519,6 +531,7 @@ local function equipBestWarriors()
     end
 end
 
+-- Fire the ProximityPrompt "E" button via its inner TextButton
 local function pressE()
     local prompts = pgui:FindFirstChild("ProximityPrompts")
     if not prompts then return false end
@@ -536,6 +549,7 @@ local function pressE()
     return false
 end
 
+-- Click a dialog option by matching text in dialogue BillboardGui
 local function clickDialog(searchText)
     searchText = string.lower(searchText)
     local dialogue = pgui:FindFirstChild("dialogue")
@@ -543,6 +557,7 @@ local function clickDialog(searchText)
     for _, obj in ipairs(dialogue:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Visible then
             if string.find(string.lower(obj.Text), searchText, 1, true) then
+                -- Find sibling TextButton in same parent Frame
                 local parent = obj.Parent
                 if parent then
                     for _, sibling in ipairs(parent:GetChildren()) do
@@ -562,6 +577,7 @@ local function clickDialog(searchText)
     end
     return false
 end
+
 
 local function clickLeadToInvasion()
     local clicked = false
@@ -625,6 +641,7 @@ local function clickCardFromLabel(label, title, index)
         current = current.Parent
     end
 
+    -- Some builds expect the card title, button name, or slot through the remote. Try these after UI clicks.
     if R.voteCard and title then
         local guesses = { title, label.Name, index }
         for _, guess in ipairs(guesses) do
@@ -768,6 +785,7 @@ local function farmLoop()
         local enemies = getAliveEnemies()
 
         if #enemies > 0 then
+            -- Sort by distance
             local _, myHRP = getChar()
             if myHRP then
                 table.sort(enemies, function(a, b)
@@ -777,6 +795,8 @@ local function farmLoop()
             end
             attackTarget(enemies[1])
         else
+            -- No enemies alive = between waves or boss dead
+            -- Teleport to boss area and swing (catches spawning enemies)
             local bossPos = State.selectedRaid.bossPos
             if bossPos then
                 local _, hrp = getChar()
@@ -793,32 +813,6 @@ local function farmLoop()
             swingWeapon()
         end
     end
-end
-
--- =============================================
---  BYPASS HELPER
--- =============================================
-
-local function bypassToInvasion()
-    print("[AF] Attempting to bypass dialog to start invasion...")
-    local dialogueGui = pgui:FindFirstChild("dialogue")
-    if not dialogueGui then return false end
-
-    for _, obj in ipairs(dialogueGui:GetDescendants()) do
-        if (obj:IsA("TextButton") or obj:IsA("TextLabel")) and obj.Visible then
-            local text = string.lower(obj.Text)
-            if string.find(text, "lead me") or string.find(text, "invasion") then
-                pcall(function()
-                    for _, conn in pairs(getconnections(obj.Activated)) do
-                        conn:Fire()
-                    end
-                end)
-                print("[AF] Successfully triggered bypass button: " .. obj.Text)
-                return true
-            end
-        end
-    end
-    return false
 end
 
 -- =============================================
@@ -854,6 +848,7 @@ local function raidCycleLoop()
                     task.wait(0.3)
                 end
 
+                -- Teleport to portal/NPC
                 local _, hrp = getChar()
                 if hrp then
                     print("[AF] Teleporting to " .. raid.display .. " portal...")
@@ -862,19 +857,54 @@ local function raidCycleLoop()
                 end
 
                 if raid.raidType == "invasion" then
-                    if not bypassToInvasion() then
-                        pressE() 
-                        task.wait(1)
-                        clickLeadToInvasion()
+                    -- Bypassing the physical E press and talking sequence using provided Button Spy Paths
+                    local bypassed = false
+                    
+                    pcall(function()
+                        -- 1. Try to directly fire the "Lead me" dialogue TextButton without pressing E
+                        local diagBtn = pgui.dialogue.BillboardGui.Frame.Frame.Frame.TextButton
+                        for _, conn in pairs(getconnections(diagBtn.Activated)) do conn:Fire() end
+                        bypassed = true
+                    end)
+
+                    if not bypassed then
+                        pcall(function()
+                            -- 2. Fallback: Fire the Proximity Prompt UI TextButton directly from anywhere near the NPC
+                            local proxBtn = pgui.ProximityPrompts.BillboardGui.Frame.inner.TextButton
+                            for _, conn in pairs(getconnections(proxBtn.Activated)) do conn:Fire() end
+                        end)
+                        task.wait(0.3)
+                        pcall(function()
+                            -- Try clicking "Lead me" directly after forcing the prompt
+                            local diagBtn = pgui.dialogue.BillboardGui.Frame.Frame.Frame.TextButton
+                            for _, conn in pairs(getconnections(diagBtn.Activated)) do conn:Fire() end
+                        end)
                     end
-                    task.wait(1)
-                    clickByText("start invasion")
+
+                    -- Fallback to standard loop functions if precise UI path firing fails
+                    if not bypassed then clickLeadToInvasion() end
+                    
                     task.wait(0.5)
-                    clickByText("yes")
-                else
                     createRaid()
+                    task.wait(1)
+                else
+                    -- Boss Raids
+                    task.wait(0.5)
+                    createRaid()
+                    task.wait(1)
                 end
             end
         end
     end
 end
+
+-- =============================================
+--  STARTUP LOOPS
+-- =============================================
+task.spawn(farmLoop)
+task.spawn(raidCycleLoop)
+task.spawn(function()
+    while task.wait(1) do
+        if State.running then autoVoteCard() end
+    end
+end)
