@@ -1,159 +1,95 @@
--- Position capture + Boss debugger
-local player = game.Players.LocalPlayer
-local pgui = player.PlayerGui
-local result = "=== POSITION & BOSS DEBUG ===\n"
+-- INVASION BYPASS TEST
+-- Run this in the lobby (NOT near Bald Hero) to see if direct remote works
 
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local pgui = player:WaitForChild("PlayerGui", 10)
+local result = "=== INVASION BYPASS TEST ===\n"
+
+-- Find remote
+local remoBase
+pcall(function()
+    remoBase = RS:WaitForChild("rbxts_include", 5)
+        :WaitForChild("node_modules", 5):WaitForChild("@rbxts", 5)
+        :WaitForChild("remo", 5):WaitForChild("src", 5):WaitForChild("container", 5)
+end)
+
+local createInvasion = remoBase and remoBase:FindFirstChild("invasions") and remoBase.invasions:FindFirstChild("create")
+result = result .. "Remote found: " .. tostring(createInvasion ~= nil) .. "\n"
+result = result .. "Remote class: " .. (createInvasion and createInvasion.ClassName or "nil") .. "\n"
+
+-- Record Y position before
+local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+local startY = hrp and hrp.Position.Y or 0
+result = result .. "Start Y: " .. math.floor(startY) .. "\n\n"
+
+-- Try InvokeServer
+result = result .. "Trying InvokeServer...\n"
+local invokeOk, invokeErr
+if createInvasion then
+    invokeOk, invokeErr = pcall(function()
+        local ret = createInvasion:InvokeServer("Dark Matter Invasion", {friendsOnly = false})
+        result = result .. "Return value: " .. tostring(ret) .. " (" .. typeof(ret) .. ")\n"
+        if typeof(ret) == "table" then
+            for k, v in pairs(ret) do
+                result = result .. "  " .. tostring(k) .. " = " .. tostring(v) .. "\n"
+            end
+        end
+    end)
+    result = result .. "InvokeServer ok: " .. tostring(invokeOk) .. "\n"
+    if not invokeOk then result = result .. "Error: " .. tostring(invokeErr) .. "\n" end
+end
+
+-- Wait and check if we teleported
+task.wait(5)
+hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+local endY = hrp and hrp.Position.Y or 0
+result = result .. "\nAfter 5s Y: " .. math.floor(endY) .. "\n"
+result = result .. "Teleported to raid: " .. tostring(endY > 5000) .. "\n"
+
+-- Check if Start Invasion UI appeared
+local foundStart = false
+for _, obj in ipairs(pgui:GetDescendants()) do
+    if obj:IsA("TextLabel") and obj.Visible then
+        if string.find(string.lower(obj.Text), "start invasion", 1, true) then
+            foundStart = true
+            break
+        end
+    end
+end
+result = result .. "Start Invasion UI visible: " .. tostring(foundStart) .. "\n"
+
+-- GUI
 local sg = Instance.new("ScreenGui", pgui)
-sg.Name = "PosSpy"; sg.ResetOnSpawn = false
-
+sg.Name = "BypassTest"; sg.ResetOnSpawn = false; sg.DisplayOrder = 999
 local bar = Instance.new("Frame", sg)
-bar.Size = UDim2.new(0.92, 0, 0, 90)
-bar.Position = UDim2.new(0.04, 0, 0.01, 0)
-bar.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
-bar.BorderSizePixel = 0
+bar.Size = UDim2.new(0.7, 0, 0, 36); bar.Position = UDim2.new(0.15, 0, 0.01, 0)
+bar.BackgroundColor3 = Color3.fromRGB(20, 20, 25); bar.BorderSizePixel = 0
 Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 10)
 
-local posLabel = Instance.new("TextLabel", bar)
-posLabel.Size = UDim2.new(1, -10, 0, 20)
-posLabel.Position = UDim2.new(0, 5, 0, 5)
-posLabel.BackgroundTransparency = 1
-posLabel.TextColor3 = Color3.fromRGB(255, 210, 50)
-posLabel.TextSize = 11; posLabel.Font = Enum.Font.Code
-posLabel.TextXAlignment = Enum.TextXAlignment.Left
-posLabel.Text = "Pos: loading..."
-
-local saveBtn = Instance.new("TextButton", bar)
-saveBtn.Size = UDim2.new(0.45, 0, 0, 34)
-saveBtn.Position = UDim2.new(0.02, 0, 0, 28)
-saveBtn.BackgroundColor3 = Color3.fromRGB(40, 180, 95)
-saveBtn.Text = "Save Portal Pos"
-saveBtn.TextColor3 = Color3.new(1,1,1)
-saveBtn.TextSize = 12; saveBtn.Font = Enum.Font.GothamBold
-saveBtn.BorderSizePixel = 0
-Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 7)
-
-local bossBtn = Instance.new("TextButton", bar)
-bossBtn.Size = UDim2.new(0.45, 0, 0, 34)
-bossBtn.Position = UDim2.new(0.52, 0, 0, 28)
-bossBtn.BackgroundColor3 = Color3.fromRGB(145, 115, 205)
-bossBtn.Text = "Dump Boss Info"
-bossBtn.TextColor3 = Color3.new(1,1,1)
-bossBtn.TextSize = 12; bossBtn.Font = Enum.Font.GothamBold
-bossBtn.BorderSizePixel = 0
-Instance.new("UICorner", bossBtn).CornerRadius = UDim.new(0, 7)
+local status = Instance.new("TextLabel", bar)
+status.Size = UDim2.new(0.5,0,1,0); status.Position = UDim2.new(0,8,0,0)
+status.BackgroundTransparency = 1; status.TextColor3 = Color3.fromRGB(255,210,50)
+status.TextSize = 10; status.Font = Enum.Font.GothamBold; status.TextXAlignment = Enum.TextXAlignment.Left
+status.Text = endY > 5000 and "BYPASS WORKS!" or "Bypass failed"
 
 local copyBtn = Instance.new("TextButton", bar)
-copyBtn.Size = UDim2.new(0.45, 0, 0, 24)
-copyBtn.Position = UDim2.new(0.02, 0, 0, 64)
-copyBtn.BackgroundColor3 = Color3.fromRGB(85, 145, 215)
-copyBtn.Text = "Copy All"
-copyBtn.TextColor3 = Color3.new(1,1,1)
-copyBtn.TextSize = 11; copyBtn.Font = Enum.Font.GothamBold
+copyBtn.Size = UDim2.new(0.22,0,0,26); copyBtn.Position = UDim2.new(0.52,0,0,5)
+copyBtn.BackgroundColor3 = Color3.fromRGB(85,145,215); copyBtn.Text = "Copy"
+copyBtn.TextColor3 = Color3.new(1,1,1); copyBtn.TextSize = 11; copyBtn.Font = Enum.Font.GothamBold
 copyBtn.BorderSizePixel = 0
-Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 7)
+Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 6)
 
-local closeBtn = Instance.new("TextButton", bar)
-closeBtn.Size = UDim2.new(0.45, 0, 0, 24)
-closeBtn.Position = UDim2.new(0.52, 0, 0, 64)
-closeBtn.BackgroundColor3 = Color3.fromRGB(200, 55, 55)
-closeBtn.Text = "Close"
-closeBtn.TextColor3 = Color3.new(1,1,1)
-closeBtn.TextSize = 11; closeBtn.Font = Enum.Font.GothamBold
-closeBtn.BorderSizePixel = 0
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 7)
+local stopBtn = Instance.new("TextButton", bar)
+stopBtn.Size = UDim2.new(0.22,0,0,26); stopBtn.Position = UDim2.new(0.76,0,0,5)
+stopBtn.BackgroundColor3 = Color3.fromRGB(200,55,55); stopBtn.Text = "Close"
+stopBtn.TextColor3 = Color3.new(1,1,1); stopBtn.TextSize = 11; stopBtn.Font = Enum.Font.GothamBold
+stopBtn.BorderSizePixel = 0
+Instance.new("UICorner", stopBtn).CornerRadius = UDim.new(0, 6)
 
--- Update position display
-task.spawn(function()
-    while sg.Parent do
-        task.wait(0.3)
-        local char = player.Character
-        if char and char:FindFirstChild("HumanoidRootPart") then
-            local p = char.HumanoidRootPart.Position
-            posLabel.Text = string.format("Pos: %.0f, %.0f, %.0f", p.X, p.Y, p.Z)
-        end
-    end
-end)
-
--- Save portal position
-saveBtn.MouseButton1Click:Connect(function()
-    local char = player.Character
-    if char and char:FindFirstChild("HumanoidRootPart") then
-        local p = char.HumanoidRootPart.Position
-        local line = string.format("\n[PORTAL POS] %.1f, %.1f, %.1f", p.X, p.Y, p.Z)
-        result = result .. line .. "\n"
-        saveBtn.Text = "Saved!"
-        saveBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
-        task.wait(1)
-        saveBtn.Text = "Save Portal Pos"
-        saveBtn.BackgroundColor3 = Color3.fromRGB(40, 180, 95)
-    end
-end)
-
--- Dump boss/enemy info
-bossBtn.MouseButton1Click:Connect(function()
-    local w = workspace:FindFirstChild("World")
-    local ef = w and w:FindFirstChild("Enemies")
-    if not ef then result = result .. "\nNo enemy folder found!\n"; return end
-    
-    result = result .. "\n=== ALL ENEMIES (detailed) ===\n"
-    for _, e in ipairs(ef:GetChildren()) do
-        if e:IsA("Model") then
-            result = result .. "\nEnemy: " .. e.Name .. "\n"
-            
-            -- All attributes
-            local attrs = e:GetAttributes()
-            if next(attrs) then
-                for k, v in pairs(attrs) do
-                    result = result .. "  [attr] " .. k .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")\n"
-                end
-            else
-                result = result .. "  [attr] NONE\n"
-            end
-            
-            -- Humanoid
-            local hum = e:FindFirstChildOfClass("Humanoid")
-            if hum then
-                result = result .. "  [hum] Name='" .. hum.Name .. "' Display='" .. tostring(hum.DisplayName) .. "' HP=" .. hum.Health .. "/" .. hum.MaxHealth .. "\n"
-            else
-                result = result .. "  [hum] NO HUMANOID\n"
-            end
-            
-            -- HumanoidRootPart
-            local hrp = e:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                result = result .. "  [pos] " .. string.format("%.0f, %.0f, %.0f", hrp.Position.X, hrp.Position.Y, hrp.Position.Z) .. "\n"
-            else
-                result = result .. "  [pos] NO HRP\n"
-            end
-            
-            -- All children (full list)
-            result = result .. "  [children] "
-            for _, c in ipairs(e:GetChildren()) do
-                result = result .. c.Name .. "(" .. c.ClassName .. ") "
-            end
-            result = result .. "\n"
-            
-            -- Billboards
-            for _, desc in ipairs(e:GetDescendants()) do
-                if desc:IsA("TextLabel") and desc.Text ~= "" then
-                    result = result .. "  [text] '" .. desc.Text .. "' in " .. desc.Parent.ClassName .. "\n"
-                end
-            end
-        end
-    end
-    
-    bossBtn.Text = "Dumped!"
-    task.wait(1)
-    bossBtn.Text = "Dump Boss Info"
-end)
-
--- Copy
 copyBtn.MouseButton1Click:Connect(function()
     setclipboard(result)
-    copyBtn.Text = "Copied!"
-    task.wait(1)
-    copyBtn.Text = "Copy All"
+    copyBtn.Text = "Copied!"; task.wait(1); copyBtn.Text = "Copy"
 end)
-
--- Close
-closeBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
+stopBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
