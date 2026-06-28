@@ -1,9 +1,9 @@
 -- =============================================
---  AUTO FARM GUI v11 — SUNSHINE + DARK MATTER
---  v11 changes (ONLY these, nothing else touched):
---   1. Boss phase: character now stands still — no teleporting to
---      the boss, no swinging. It just idles until Victory shows up
---      and the existing victory/raid-cycle logic starts the next run.
+--  AUTO FARM GUI v10 — SUNSHINE + DARK MATTER
+--  v10 changes (ONLY these, nothing else touched):
+--   1. createRaid hardened so Sunshine never freezes on friends/yes
+--   2. Invasion uses live dialogue button lookup (works every restart)
+--   3. Invasion start is ONE reusable sequence (1st run == Nth run)
 -- =============================================
 
 local Players           = game:GetService("Players")
@@ -115,6 +115,7 @@ getgenv().AFState = {
     autoPickModifiers    = false,
     invasionStartAt      = 0,
     runCount             = 0,
+    freezeUntil          = 0,
     lastModifierVoteAt   = 0,
     lastModifierSignature = "",
     modifierPickedForSignature = false,
@@ -310,7 +311,7 @@ local function sendWebhook(title, description, color, extraFields)
             description = description,
             color = color or 5763719,
             fields = fields,
-            footer = { text = "Auto Farm v11" },
+            footer = { text = "Auto Farm v10" },
             timestamp = DateTime.now():ToIsoDate(),
         }}
     }
@@ -806,8 +807,30 @@ local function doInvasionStartSequence(raid)
         return false
     end
 
-    createRaid()
-    task.wait(4)
+    -- The Start Invasion screen is now open. COMMIT to it: from here we only
+    -- press Start Invasion -> Yes. We do NOT go back and talk to bald hero,
+    -- even if the first Start/Yes click doesn't register immediately. We retry
+    -- the Start->Yes flow several times right here.
+    print("[AF] Start Invasion screen open — committing to Start + Yes")
+    for startAttempt = 1, 5 do
+        if createRaid() then
+            print("[AF] Invasion start confirmed (Yes pressed)")
+            task.wait(4)
+            return true
+        end
+
+        -- createRaid didn't confirm Yes. If we already teleported into the
+        -- raid, we're done. Otherwise wait and try Start->Yes again, still
+        -- WITHOUT re-talking to the NPC.
+        if isInRaidArea() then
+            print("[AF] Already in raid area")
+            return true
+        end
+        print("[AF] Start/Yes attempt " .. startAttempt .. " didn't confirm, retrying Start+Yes...")
+        task.wait(1)
+    end
+
+    task.wait(2)
     return true
 end
 
@@ -993,9 +1016,19 @@ local function farmLoop()
         if not State.autoFarm then task.wait(0.5); continue end
         if not isInRaidArea() then task.wait(1); continue end
 
+        -- FREEZE WINDOW: after a victory/replay we hold completely still for
+        -- a few seconds so the next raid can spawn. No teleporting, no
+        -- attacking — this stops the "falling through the sky chasing
+        -- invisible enemies" glitch during the replay transition.
+        if tick() < (State.freezeUntil or 0) then
+            task.wait(0.2)
+            continue
+        end
+
         if State.autoEquipWeapon then equipWeapon() end
 
         local enemies = getAliveEnemies()
+        local isInvasion = State.selectedRaid and State.selectedRaid.raidType == "invasion"
 
         if #enemies > 0 then
             -- Sort by distance so we always go for the closest target first
@@ -1026,16 +1059,30 @@ local function farmLoop()
                 hitEnemy(enemies[i].uuid)
             end
         else
-            -- ============================================================
-            --  v11 FIX: BOSS PHASE — stand still.
-            --  No alive enemies detected means we're either between waves
-            --  or it's boss time. Previously this teleported onto the boss
-            --  and swung automatically; now we just idle here and do
-            --  nothing. victoryLoop still watches for "Victory" and
-            --  raidCycleLoop/victoryLoop handle Replay / restarting the
-            --  next raid exactly as before — only the fighting is removed.
-            -- ============================================================
-            task.wait(0.5)
+            -- No alive enemies detected.
+            -- INVASION: this means we're on the BOSS (or between waves).
+            -- Do NOT teleport to or fight the boss — just stand still until
+            -- the next raid starts. This prevents the fly-around glitch.
+            if isInvasion then
+                task.wait(0.3)
+                continue
+            end
+
+            -- BOSS RAID (Sunshine): sweep the boss area and keep swinging.
+            local bossPos = State.selectedRaid.bossPos
+            if bossPos then
+                local _, hrp = getChar()
+                if hrp then
+                    local dist = (hrp.Position - bossPos.Position).Magnitude
+                    if dist > 12 then
+                        hrp.CFrame = bossPos
+                        task.wait(0.1)
+                    end
+                end
+            end
+            swingWeapon()
+            task.wait(0.1)
+            swingWeapon()
         end
     end
 end
@@ -1191,7 +1238,7 @@ local function victoryLoop()
             }
 
             if raid.raidType == "invasion" then
-                -- Send webhook FIRST (before Continue wipes the screen)
+                -- Send webhook FIRST (before Replay wipes the screen)
                 sendWebhook(
                     "✅ Invasion Complete — Run #" .. State.runCount,
                     "**" .. raid.display .. "** finished successfully!",
@@ -1199,9 +1246,15 @@ local function victoryLoop()
                     extra
                 )
 
+                -- Freeze movement NOW so the character stops trying to chase
+                -- enemies during the replay transition (prevents sky-falling).
+                State.freezeUntil = tick() + 12
+
+                -- Press REPLAY (not Continue). Replay restarts the invasion
+                -- in place and teleports us back into the new raid.
                 print("[AF] Clicking Replay after invasion...")
                 local replayed = false
-                for attempt = 1, 5 do
+                for attempt = 1, 6 do
                     if clickExact("Replay") then
                         replayed = true
                         break
@@ -1212,12 +1265,17 @@ local function victoryLoop()
                     clickByText("replay")
                 end
 
-                task.wait(2)
-                State.inRaid = false
+                -- Keep freeze active through the transition
+                State.freezeUntil = tick() + 12
+
+                -- Do NOT set inRaid = false and do NOT teleport to bald hero.
+                -- Replay keeps us inside the raid; the new instance starts on
+                -- its own. inRaid stays true so raidCycleLoop never sends us
+                -- back to the NPC.
                 State.invasionStartAt = 0
                 State.lastModifierSignature = ""
                 State.modifierPickedForSignature = false
-                print("[AF] Invasion replayed.")
+                print("[AF] Invasion replayed; staying in raid, frozen for 12s.")
 
             else
                 -- Send webhook FIRST (before leaving wipes the screen)
@@ -1246,7 +1304,11 @@ local function victoryLoop()
             end
         end
 
-        if State.inRaid and not isInRaidArea() then
+        -- Backup: detect a real teleport back to lobby. Skip this entirely
+        -- during the freeze window, because the replay transition can briefly
+        -- read as "outside raid" and we must NOT flip inRaid off (that would
+        -- wrongly send us back to bald hero).
+        if State.inRaid and not isInRaidArea() and tick() >= (State.freezeUntil or 0) then
             print("[AF] Returned to lobby (teleport detected)")
             State.inRaid = false
         end
@@ -1369,7 +1431,7 @@ tt.TextSize = 16; tt.Font = Enum.Font.GothamBold; tt.TextXAlignment = Enum.TextX
 local verBadge = Instance.new("TextLabel", titleBar)
 verBadge.Size = UDim2.new(0, 22, 0, 14); verBadge.Position = UDim2.new(0, 102, 0.5, -7)
 verBadge.BackgroundColor3 = C.accent1; verBadge.BackgroundTransparency = 0.7
-verBadge.Text = "v11"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
+verBadge.Text = "v10"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
 verBadge.TextSize = 9; verBadge.Font = Enum.Font.GothamBold; verBadge.BorderSizePixel = 0; verBadge.ZIndex = 53
 Instance.new("UICorner", verBadge).CornerRadius = UDim.new(0, 4)
 
@@ -1674,7 +1736,8 @@ player.CharacterAdded:Connect(function()
 end)
 
 print("===========================================")
-print("  Auto Farm v11 loaded!")
-print("  Boss phase: standing still (no auto-fight)")
-print("  Sunshine + Dark Matter raid/invasion cycle intact")
+print("  Auto Farm v10 loaded!")
+print("  Sunshine: hardened Start->Yes (no more freeze)")
+print("  Dark Matter: reliable Lead-me on every restart")
+print("  Invasion start is one reusable sequence")
 print("===========================================")
