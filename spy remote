@@ -642,6 +642,88 @@ local function clickAnyButtonWithText(searchText)
     return false
 end
 
+-- ============================================================
+-- HARD CLICK: simulates a real finger tap at the center of a
+-- button using VirtualInputManager. This is the strongest method
+-- and works even when getconnections() returns nothing (some
+-- executors restrict it). Falls back silently if VIM is blocked.
+-- ============================================================
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+local function tapAtPosition(x, y)
+    if not VIM then return false end
+    local ok = pcall(function()
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.04)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    return ok
+end
+
+-- Tap the center of a GuiObject on screen.
+local function tapButton(btn)
+    if not btn then return false end
+    local okPos, pos, size = pcall(function()
+        return btn.AbsolutePosition, btn.AbsoluteSize
+    end)
+    if not okPos or not pos then return false end
+    local cx = pos.X + (size and size.X or 0) / 2
+    local cy = pos.Y + (size and size.Y or 0) / 2
+    return tapAtPosition(cx, cy)
+end
+
+-- Find every visible button/label matching text and HARD-TAP each candidate.
+-- Returns true if at least one tap was sent. This is used as the final,
+-- most reliable attempt for the Start Invasion and Yes buttons.
+local function hardClickButtonWithText(searchText)
+    searchText = string.lower(searchText)
+    local afGui = pgui:FindFirstChild("AutoFarmGUI")
+    local tappedAny = false
+
+    -- 1) Buttons whose own text matches
+    for _, obj in ipairs(pgui:GetDescendants()) do
+        if (obj:IsA("TextButton") or obj:IsA("ImageButton")) and obj.Visible then
+            if afGui and obj:IsDescendantOf(afGui) then continue end
+            local txt = ""
+            pcall(function() txt = obj.Text end)
+            if txt ~= "" and string.find(string.lower(txt), searchText, 1, true) then
+                if tapButton(obj) then tappedAny = true end
+            end
+        end
+    end
+
+    -- 2) Labels that match -> tap the nearest clickable button (button itself
+    --    may have no text, e.g. an ImageButton holding a child text label).
+    for _, obj in ipairs(pgui:GetDescendants()) do
+        if obj:IsA("TextLabel") and obj.Visible then
+            if afGui and obj:IsDescendantOf(afGui) then continue end
+            if string.find(string.lower(obj.Text), searchText, 1, true) then
+                -- Tap the label position itself (taps pass through to the
+                -- button underneath in most Roblox UIs).
+                if tapButton(obj) then tappedAny = true end
+                -- Also climb to find a real button to tap.
+                local anc = obj.Parent
+                for depth = 1, 6 do
+                    if not anc or anc == pgui then break end
+                    for _, d in ipairs(anc:GetDescendants()) do
+                        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+                            if tapButton(d) then tappedAny = true end
+                        end
+                    end
+                    if tappedAny then break end
+                    anc = anc.Parent
+                end
+            end
+        end
+    end
+
+    if tappedAny then
+        print("[AF] hardClick: tapped button(s) for '" .. searchText .. "'")
+    end
+    return tappedAny
+end
+
 -- Click exact text match (for Continue)
 local function clickExact(exactText)
     for _, obj in ipairs(pgui:GetDescendants()) do
@@ -887,20 +969,23 @@ end
 local function isStartInvasionPopupOpen()
     for _, obj in ipairs(pgui:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Visible then
-            if string.find(string.lower(obj.Text), "start invasion", 1, true) then
-                return true
-            end
+            local low = string.lower(obj.Text)
+            -- The Start Invasion panel, OR the Yes-confirmation popup
+            -- ("Do you want to start this ... Invasion?").
+            if string.find(low, "start invasion", 1, true) then return true end
+            if string.find(low, "do you want to start", 1, true) then return true end
         end
     end
     return false
 end
 
 local function pressStartInvasionThenYes()
-    -- Step 1: press the green "Start Invasion" button
-    local pressedStart = clickAnyButtonWithText("start invasion")
-    if pressedStart then
-        print("[AF] Pressed Start Invasion button")
-    end
+    -- Step 1: press the green "Start Invasion" button.
+    -- Try the connection-fire method AND a real screen tap so whichever the
+    -- game/executor accepts gets through.
+    clickAnyButtonWithText("start invasion")
+    hardClickButtonWithText("start invasion")
+    print("[AF] Pressed Start Invasion (fire + tap)")
     task.wait(1.2)
 
     -- Step 2: friends-only toggle if requested (optional)
@@ -910,15 +995,16 @@ local function pressStartInvasionThenYes()
     end
 
     -- Step 3: press "Yes" on the confirmation popup. Retry a few times
-    -- because the popup can appear a moment after Start is pressed.
+    -- because the popup can appear a moment after Start is pressed. Use both
+    -- click methods each attempt.
     for attempt = 1, 6 do
         if isInRaidArea() then return true end
-        if clickAnyButtonWithText("yes") then
-            print("[AF] Pressed Yes (attempt " .. attempt .. ")")
-            task.wait(1)
-            if isInRaidArea() then return true end
-        end
-        task.wait(0.6)
+        clickAnyButtonWithText("yes")
+        hardClickButtonWithText("yes")
+        print("[AF] Pressed Yes (fire + tap, attempt " .. attempt .. ")")
+        task.wait(1)
+        if isInRaidArea() then return true end
+        task.wait(0.5)
     end
 
     return isInRaidArea()
@@ -930,71 +1016,91 @@ end
 --  identical each time. Returns true if it reached createRaid.
 -- ============================================================
 local function doInvasionStartSequence(raid)
-    -- Teleport to NPC
-    local _, hrp = getChar()
-    if hrp then
-        hrp.CFrame = raid.portalPos
+    -- If the commit lock is ALREADY set, it means we previously pressed
+    -- "Lead me" and only need to finish Start Invasion -> Yes. Do NOT teleport
+    -- to the NPC or press E again. Jump straight to the popup-commit phase.
+    if not State.startingInvasion then
+        -- Teleport to NPC
+        local _, hrp = getChar()
+        if hrp then
+            hrp.CFrame = raid.portalPos
+            task.wait(2)
+        end
+
+        -- Press E (proximity), fallback to GUI E button
+        local pressed = pressEProximity()
+        if not pressed then pressE() end
+
+        -- Wait up to 5s for dialog
+        local foundLead = waitForLeadDialog(5)
+
+        -- If not found, press E ONE more time and wait again
+        if not foundLead then
+            if not pressEProximity() then pressE() end
+            foundLead = waitForLeadDialog(4)
+        end
+
+        if not foundLead then
+            print("[AF] Dialog didn't appear, retry whole cycle")
+            return false
+        end
+
+        task.wait(0.3)
+        if not clickLeadToInvasion() then
+            print("[AF] Lead me click failed, retry whole cycle")
+            return false
+        end
+
+        -- COMMIT LOCK: from the moment we press "Lead me to the invasion",
+        -- pause every other part of the script AND prevent this sequence from
+        -- ever restarting the E/talk phase. From now on only Start Invasion
+        -- and Yes run. Cleared on every exit path below.
+        State.startingInvasion = true
+        State.startingInvasionAt = tick()
         task.wait(2)
+    else
+        print("[AF] Resuming Start Invasion commit (lock already set, NOT re-talking to NPC)")
     end
-
-    -- Press E (proximity), fallback to GUI E button
-    local pressed = pressEProximity()
-    if not pressed then pressE() end
-
-    -- Wait up to 5s for dialog
-    local foundLead = waitForLeadDialog(5)
-
-    -- If not found, press E ONE more time and wait again
-    if not foundLead then
-        if not pressEProximity() then pressE() end
-        foundLead = waitForLeadDialog(4)
-    end
-
-    if not foundLead then
-        print("[AF] Dialog didn't appear, retry whole cycle")
-        return false
-    end
-
-    task.wait(0.3)
-    if not clickLeadToInvasion() then
-        print("[AF] Lead me click failed, retry whole cycle")
-        return false
-    end
-
-    -- COMMIT LOCK: from the moment we press "Lead me to the invasion", pause
-    -- every other part of the script (farming, card voting, victory checks,
-    -- weapon re-equip). The ONLY things that run now are pressing Start
-    -- Invasion and Yes. This flag is cleared on every exit path below.
-    State.startingInvasion = true
-    State.startingInvasionAt = tick()
-    task.wait(2)
 
     -- Wait for Start Invasion UI
     local uiFound = false
     for _ = 1, 12 do
-        for _, obj in ipairs(pgui:GetDescendants()) do
-            if obj:IsA("TextLabel") and obj.Visible then
-                if string.find(string.lower(obj.Text), "start invasion", 1, true) then
-                    uiFound = true
-                    break
-                end
-            end
-        end
-        if uiFound then break end
+        if isStartInvasionPopupOpen() then uiFound = true; break end
         task.wait(0.5)
     end
 
+    -- If the popup didn't show but we're committed (lock set), try clicking
+    -- "Lead me" again WITHOUT pressing E, then wait once more. We do NOT
+    -- clear the lock here — clearing it would let the script walk back and
+    -- re-talk to Bald Hero, which is exactly what we must avoid.
     if not uiFound then
-        print("[AF] Start Invasion UI not found, retry whole cycle")
+        print("[AF] Start Invasion popup not visible yet — re-clicking Lead me (no E)")
+        clickLeadToInvasion()
+        for _ = 1, 10 do
+            if isStartInvasionPopupOpen() then uiFound = true; break end
+            task.wait(0.5)
+        end
+    end
+
+    if not uiFound then
+        -- Still nothing. As a final attempt, fire the create remote directly
+        -- instead of bailing back to the NPC.
+        print("[AF] Popup never appeared — firing createInvasion remote")
+        if R.createInvasion then
+            pcall(function()
+                R.createInvasion:InvokeServer(raid.name, { friendsOnly = State.friendOnly })
+            end)
+            task.wait(3)
+        end
         State.startingInvasion = false
-        return false
+        return isInRaidArea()
     end
 
     -- The Start Invasion screen is now open. COMMIT to it: from here we only
     -- press Start Invasion -> Yes. We do NOT go back and talk to bald hero
     -- while this popup is showing, even if the first click doesn't register.
     print("[AF] Start Invasion popup open — committing to Start + Yes")
-    for startAttempt = 1, 8 do
+    for startAttempt = 1, 12 do
         -- If we made it into the raid, we're done.
         if isInRaidArea() then
             print("[AF] Entered raid area!")
@@ -1308,9 +1414,9 @@ local function raidCycleLoop()
         task.wait(3)
 
         -- SAFETY WATCHDOG: if the commit lock has somehow been held longer
-        -- than 45 seconds (e.g. an unexpected error in the start sequence),
+        -- than 90 seconds (e.g. an unexpected error in the start sequence),
         -- force-clear it so the rest of the script never stays frozen.
-        if State.startingInvasion and (tick() - (State.startingInvasionAt or 0)) > 45 then
+        if State.startingInvasion and (tick() - (State.startingInvasionAt or 0)) > 90 then
             print("[AF] Commit lock held too long — force clearing")
             State.startingInvasion = false
         end
