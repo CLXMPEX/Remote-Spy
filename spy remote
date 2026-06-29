@@ -1194,6 +1194,14 @@ local function pressButtonOnce(searchText)
 end
 
 local function pressStartInvasionThenYes()
+    -- Helper: try several text variations for the Start button in one press.
+    local function pressStartButton()
+        pressButtonOnce("start invasion")
+        pressButtonOnce("start invasion 1x")
+        -- "invasion" alone is risky (matches title), so only use it if the
+        -- popup is confirmed open and we still haven't advanced.
+    end
+
     -- ---- Step 1: Start Invasion ----
     -- Press it, then WAIT and check if the Yes popup appeared. Only press
     -- again if it did NOT appear. The moment the popup shows, we stop pressing
@@ -1205,7 +1213,7 @@ local function pressStartInvasionThenYes()
             break  -- Start worked; stop pressing it
         end
 
-        pressButtonOnce("start invasion")
+        pressStartButton()
         print("[AF] Pressed Start Invasion once (attempt " .. attempt .. ")")
 
         -- Wait and watch for the popup before deciding to press again.
@@ -1256,10 +1264,23 @@ end
 --  identical each time. Returns true if it reached createRaid.
 -- ============================================================
 local function doInvasionStartSequence(raid)
-    -- If the commit lock is ALREADY set, it means we previously pressed
-    -- "Lead me" and only need to finish Start Invasion -> Yes. Do NOT teleport
-    -- to the NPC or press E again. Jump straight to the popup-commit phase.
-    if not State.startingInvasion then
+    -- LOCK EVERYTHING NOW. The moment we begin approaching Bald Hero, pause
+    -- every other loop in the script (farming, voting, victory scan, utility,
+    -- status). From here until we're teleported into the raid, the ONLY things
+    -- that run are: talk to NPC -> Lead me -> Start Invasion -> Yes.
+    local hadLock = State.startingInvasion
+    State.startingInvasion = true
+    if not hadLock then
+        State.startingInvasionAt = tick()
+    end
+
+    -- If the lock was ALREADY set from a previous attempt, it means we already
+    -- talked to the NPC and only need to finish Start Invasion -> Yes. Do NOT
+    -- teleport or press E again — jump straight to the popup-commit phase.
+    if not hadLock then
+        -- Give the other loops a brief moment to notice the lock and park.
+        task.wait(0.2)
+
         -- Teleport to NPC
         local _, hrp = getChar()
         if hrp then
@@ -1282,21 +1303,19 @@ local function doInvasionStartSequence(raid)
 
         if not foundLead then
             print("[AF] Dialog didn't appear, retry whole cycle")
+            -- release the lock so the cycle can retry from the top cleanly
+            State.startingInvasion = false
             return false
         end
 
         task.wait(0.3)
         if not clickLeadToInvasion() then
             print("[AF] Lead me click failed, retry whole cycle")
+            State.startingInvasion = false
             return false
         end
 
-        -- COMMIT LOCK: from the moment we press "Lead me to the invasion",
-        -- pause every other part of the script AND prevent this sequence from
-        -- ever restarting the E/talk phase. From now on only Start Invasion
-        -- and Yes run. Cleared on every exit path below.
-        State.startingInvasion = true
-        State.startingInvasionAt = tick()
+        print("[AF] Lead me pressed — everything else paused, focusing on Start + Yes")
         task.wait(2)
     else
         print("[AF] Resuming Start Invasion commit (lock already set, NOT re-talking to NPC)")
@@ -1561,12 +1580,15 @@ end
 
 local function farmLoop()
     while State.running do
+        -- HARD PAUSE: if we're in the Start-Invasion sequence, do absolutely
+        -- nothing — don't even read enemies or position. Just wait for the
+        -- lock to clear. This guarantees nothing competes with Start + Yes.
+        if State.startingInvasion then
+            repeat task.wait(0.1) until (not State.startingInvasion) or (not State.running)
+        end
+
         task.wait(0.15)
         if not State.autoFarm then task.wait(0.5); continue end
-
-        -- COMMIT LOCK: while starting an invasion (after "Lead me" is pressed),
-        -- pause farming entirely so nothing competes with Start Invasion + Yes.
-        if State.startingInvasion then task.wait(0.2); continue end
 
         if not isInRaidArea() then task.wait(1); continue end
 
@@ -1785,12 +1807,14 @@ end
 
 local function victoryLoop()
     while State.running do
+        -- HARD PAUSE during Start-Invasion sequence: no card voting, no
+        -- victory scanning, nothing. Just wait for the lock to clear.
+        if State.startingInvasion then
+            repeat task.wait(0.1) until (not State.startingInvasion) or (not State.running)
+        end
+
         task.wait(1)
         if not State.autoFarm then continue end
-
-        -- COMMIT LOCK: while starting an invasion, don't vote cards or scan
-        -- for victory — only Start Invasion + Yes should be happening.
-        if State.startingInvasion then continue end
 
         if State.inRaid and State.selectedRaid.raidType == "invasion" then
             autoVoteCard()
@@ -1929,9 +1953,13 @@ end
 
 local function utilityLoop()
     while State.running do
+        -- HARD PAUSE during Start-Invasion sequence: no achievement claims,
+        -- no weapon equipping, nothing.
+        if State.startingInvasion then
+            repeat task.wait(0.1) until (not State.startingInvasion) or (not State.running)
+        end
+
         task.wait(3)
-        -- COMMIT LOCK: pause utility actions during invasion start.
-        if State.startingInvasion then continue end
         if State.autoClaimAchievement then pcall(claimAchievements) end
         if State.autoEquipWeapon then equipWeapon() end
     end
@@ -2305,7 +2333,18 @@ task.spawn(utilityLoop)
 
 task.spawn(function()
     while State.running do
+        -- During the Start-Invasion sequence, show a dedicated status and do
+        -- no enemy scanning — keep everything out of the way.
+        if State.startingInvasion then
+            statusBar.Text = "Starting invasion — pressing Start + Yes"
+            statusBar.TextColor3 = C.accent3
+            statusDot.BackgroundColor3 = C.accent3
+            repeat task.wait(0.1) until (not State.startingInvasion) or (not State.running)
+        end
+
         task.wait(1)
+        if State.startingInvasion then continue end
+
         if State.autoFarm then
             local enemies = getAliveEnemies()
             local inRaid = isInRaidArea()
