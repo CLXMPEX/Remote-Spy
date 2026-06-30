@@ -1,5 +1,5 @@
 -- =============================================
---  AUTO FARM GUI v5 — SUNSHINE + DARK MATTER
+--  AUTO FARM GUI v9 — SUNSHINE + DARK MATTER
 --  Supports both bossRaids and invasions
 -- =============================================
 
@@ -40,7 +40,6 @@ local R = {
     leaveRaid       = getRemote("bossRaids", "leaveRaid"),
     -- Invasions (Dark Matter)
     createInvasion  = getRemote("invasions", "create"),
-    replayInvasion  = getRemote("invasions", "replay"),
     voteCard        = getRemote("invasions", "voteCard"),
     -- Shared
     lobbyStart      = getRemote("lobbies", "start"),
@@ -76,11 +75,14 @@ local RaidList = {
         display = "Dark Matter",
         raidType = "invasion",       -- uses invasions.create
         portalPos = CFrame.new(-1743, -1490, -745),  -- Saitama NPC
-        bossPos = CFrame.new(5068, 6030, -150),      -- boss area
+        bossPos = CFrame.new(4911, 6020, 161),       -- invasion hold/farm position
         startText = "start invasion", -- UI button text
         working = true,
     },
 }
+
+local INVASION_HOLD_POS = CFrame.new(4911, 6020, 161)
+local INVASION_START_TIMEOUT = 20
 
 local ModifierOptions = {
     "Disabled",
@@ -110,7 +112,11 @@ getgenv().AFState = {
     webhookEnabled       = false,
     webhookUrl           = "",
     webhookRewards       = true,
-    replayGraceUntil     = 0,
+    autoPickModifiers    = false,
+    invasionStartAt      = 0,
+    lastModifierVoteAt   = 0,
+    lastModifierSignature = "",
+    modifierPickedForSignature = false,
     modifierPriorities   = {
         "Boss Killer",
         "Overflowing Wealth",
@@ -225,7 +231,7 @@ local function sendWebhook(title, description, color)
                 { name = "Raid", value = State.selectedRaid and State.selectedRaid.display or "Unknown", inline = true },
                 { name = "Player", value = player.Name, inline = true },
             },
-            footer = { text = "Auto Farm v5" },
+            footer = { text = "Auto Farm v9" },
             timestamp = DateTime.now():ToIsoDate(),
         }}
     }
@@ -333,6 +339,27 @@ local function attackTarget(target)
     swingWeapon()
 end
 
+local function isSelectedInvasion()
+    return State.selectedRaid and State.selectedRaid.raidType == "invasion"
+end
+
+local function moveToInvasionHold(reason)
+    if not isSelectedInvasion() or not isInRaidArea() then return false end
+    local _, hrp = getChar()
+    if not hrp then return false end
+    hrp.CFrame = INVASION_HOLD_POS
+    print("[AF] Holding invasion position" .. (reason and (" (" .. reason .. ")") or ""))
+    return true
+end
+
+local function invasionStartTimedOut()
+    return isSelectedInvasion()
+       and (State.invasionStartAt or 0) > 0
+       and not isInRaidArea()
+       and (tick() - State.invasionStartAt) >= INVASION_START_TIMEOUT
+end
+
+
 -- =============================================
 --  RAID MANAGEMENT
 -- =============================================
@@ -407,7 +434,7 @@ local function clickByText(searchText)
     return false
 end
 
--- Click exact text match (for Continue/Replay)
+-- Click exact text match (for Continue)
 local function clickExact(exactText)
     for _, obj in ipairs(pgui:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Visible and obj.Text == exactText then
@@ -445,11 +472,6 @@ local function createRaid()
     -- Try clicking the start button in game UI
     print("[AF] Looking for " .. raid.startText .. " button...")
 
-    -- For Dark Matter: first click "lead me to the invasion" if talking to NPC
-    if raid.raidType == "invasion" then
-        clickByText("lead me to the invasion")
-        task.wait(1)
-    end
 
     if clickByText(raid.startText) then
         task.wait(1.5)
@@ -501,13 +523,6 @@ local function leaveRaid()
     if R.leaveRaid then
         pcall(function() R.leaveRaid:FireServer() end)
         print("[AF] Left raid")
-    end
-end
-
-local function replayInvasion()
-    if R.replayInvasion then
-        pcall(function() R.replayInvasion:InvokeServer() end)
-        print("[AF] Replay invasion!")
     end
 end
 
@@ -564,6 +579,20 @@ local function clickDialog(searchText)
     return false
 end
 
+
+local function clickLeadToInvasion()
+    local clicked = false
+    for attempt = 1, 8 do
+        clicked = clickDialog("lead me") or clickByText("lead me to the invasion") or clickByText("lead me")
+        if clicked then
+            print("[AF] Clicked Lead me to the invasion")
+            return true
+        end
+        task.wait(0.35)
+    end
+    return false
+end
+
 local function claimAchievements()
     if R.achievementClaim then pcall(function() R.achievementClaim:FireServer() end) end
     if R.achievementClaimGroup then pcall(function() R.achievementClaimGroup:FireServer() end) end
@@ -573,25 +602,87 @@ end
 --  AUTO CARD VOTING (Invasions only)
 -- =============================================
 
-local function clickCardFromLabel(label)
-    local current = label.Parent
-    for d = 1, 10 do
-        if not current or current == pgui then break end
-        if current.Name == "inner" then
-            local tb = current:FindFirstChildOfClass("TextButton")
-            if tb then
-                pcall(function()
-                    for _, conn in pairs(getconnections(tb.Activated)) do
-                        conn:Fire()
-                    end
-                end)
-                return true
-            end
-            break
+local function fireButton(button)
+    if not button then return false end
+    local fired = false
+    pcall(function()
+        for _, conn in pairs(getconnections(button.Activated)) do
+            conn:Fire()
+            fired = true
         end
+    end)
+    pcall(function()
+        for _, conn in pairs(getconnections(button.MouseButton1Click)) do
+            conn:Fire()
+            fired = true
+        end
+    end)
+    pcall(function()
+        button:Activate()
+        fired = true
+    end)
+    return fired
+end
+
+local function clickCardFromLabel(label, title, index)
+    local current = label
+    for d = 1, 12 do
+        if not current or current == pgui then break end
+
+        if current:IsA("TextButton") or current:IsA("ImageButton") then
+            if fireButton(current) then return true end
+        end
+
+        for _, desc in ipairs(current:GetDescendants()) do
+            if desc:IsA("TextButton") or desc:IsA("ImageButton") then
+                if fireButton(desc) then return true end
+            end
+        end
+
         current = current.Parent
     end
+
+    -- Some builds expect the card title, button name, or slot through the remote. Try these after UI clicks.
+    if R.voteCard and title then
+        local guesses = { title, label.Name, index }
+        for _, guess in ipairs(guesses) do
+            local ok = pcall(function() R.voteCard:FireServer(guess) end)
+            if ok then return true end
+            ok = pcall(function() R.voteCard:InvokeServer(guess) end)
+            if ok then return true end
+        end
+    end
     return false
+end
+
+local function modifierKeysMatch(cardKey, wantedKey)
+    if string.find(cardKey, wantedKey, 1, true) or string.find(wantedKey, cardKey, 1, true) then return true end
+    if string.find(cardKey, "overflowing", 1, true) and string.find(wantedKey, "overflowing", 1, true) then return true end
+    if string.find(cardKey, "boss killer", 1, true) and string.find(wantedKey, "boss killer", 1, true) then return true end
+    return false
+end
+
+local function isKnownModifierText(low)
+    if string.find(low, "overflowing", 1, true) or string.find(low, "boss killer", 1, true) then return true end
+    for _, opt in ipairs(ModifierOptions) do
+        if opt ~= "Disabled" and string.find(low, normalizeText(opt), 1, true) then return true end
+    end
+    return false
+end
+
+local function getModifierTier(text)
+    local low = normalizeText(text)
+    local digitTier = low:match("(%d+)%s*$")
+    if digitTier then return tonumber(digitTier) or 1 end
+
+    local suffix = low:match("([il]+)%s*$")
+    if suffix then return #suffix end
+
+    suffix = low:match("([ivx]+)%s*$")
+    if suffix == "iii" then return 3 end
+    if suffix == "ii" then return 2 end
+    if suffix == "i" then return 1 end
+    return 1
 end
 
 local function getVisibleModifierCards()
@@ -601,14 +692,17 @@ local function getVisibleModifierCards()
         if obj:IsA("TextLabel") and obj.Visible then
             if obj:IsDescendantOf(pgui:FindFirstChild("AutoFarmGUI")) then continue end
             local text = trimText(obj.Text)
-            if text ~= "" and #text <= 45 and not seen[text] then
+            if text ~= "" and #text <= 55 and not seen[text] then
                 local low = normalizeText(text)
-                for _, opt in ipairs(ModifierOptions) do
-                    if opt ~= "Disabled" and string.find(low, normalizeText(opt), 1, true) then
-                        seen[text] = true
-                        table.insert(cards, { label = obj, title = text, key = low })
-                        break
-                    end
+                if isKnownModifierText(low) then
+                    seen[text] = true
+                    table.insert(cards, {
+                        label = obj,
+                        title = text,
+                        key = low,
+                        tier = getModifierTier(text),
+                        index = #cards + 1,
+                    })
                 end
             end
         end
@@ -616,28 +710,60 @@ local function getVisibleModifierCards()
     return cards
 end
 
+local function getModifierSignature(cards)
+    local parts = {}
+    for _, card in ipairs(cards) do
+        table.insert(parts, card.title .. ":" .. tostring(card.tier))
+    end
+    table.sort(parts)
+    return table.concat(parts, "|")
+end
+
 local function autoVoteCard()
-    if not R.voteCard then return end
+    if not State.autoPickModifiers then return false end
     local cards = getVisibleModifierCards()
-    if #cards == 0 then return false end
+    if #cards == 0 then
+        State.lastModifierSignature = ""
+        State.modifierPickedForSignature = false
+        return false
+    end
+
+    local signature = getModifierSignature(cards)
+    if signature ~= State.lastModifierSignature then
+        State.lastModifierSignature = signature
+        State.modifierPickedForSignature = false
+    end
+    if State.modifierPickedForSignature then return false end
 
     for _, wanted in ipairs(State.modifierPriorities or {}) do
         wanted = trimText(wanted)
         if wanted ~= "" and wanted ~= "Disabled" then
             local wantedKey = normalizeText(wanted)
+            local matches = {}
             for _, card in ipairs(cards) do
-                if string.find(card.key, wantedKey, 1, true) or string.find(wantedKey, card.key, 1, true) then
-                    if clickCardFromLabel(card.label) then
-                        print("[AF] Voted priority modifier: " .. card.title)
-                        sendWebhook("Modifier picked", "Picked **" .. card.title .. "** from priority list.", 3447003)
-                        return true
-                    end
+                if modifierKeysMatch(card.key, wantedKey) then
+                    table.insert(matches, card)
+                end
+            end
+            table.sort(matches, function(a, b)
+                if a.tier == b.tier then return a.index < b.index end
+                return a.tier > b.tier
+            end)
+            for _, card in ipairs(matches) do
+                if clickCardFromLabel(card.label, card.title, card.index) then
+                    State.lastModifierVoteAt = tick()
+                    State.modifierPickedForSignature = true
+                    print("[AF] Voted priority modifier: " .. card.title .. " (tier " .. tostring(card.tier) .. ")")
+                    sendWebhook("Modifier picked", "Picked **" .. card.title .. "** from priority list.", 3447003)
+                    return true
                 end
             end
         end
     end
 
-    if clickCardFromLabel(cards[1].label) then
+    if clickCardFromLabel(cards[1].label, cards[1].title, cards[1].index) then
+        State.lastModifierVoteAt = tick()
+        State.modifierPickedForSignature = true
         print("[AF] Voted fallback modifier: " .. cards[1].title)
         sendWebhook("Modifier picked", "Picked fallback **" .. cards[1].title .. "** because no priority cards were visible.", 15105570)
         return true
@@ -700,12 +826,19 @@ local function raidCycleLoop()
         if not State.autoFarm or not State.autoCreateRaid then continue end
         if not State.selectedRaid.working then continue end
 
-        local waitingForInvasionReplay = State.selectedRaid.raidType == "invasion" and tick() < (State.replayGraceUntil or 0)
-        if not isInRaidArea() and not State.inRaid and not waitingForInvasionReplay then
+        if isSelectedInvasion() and isInRaidArea() then
+            State.inRaid = true
+            State.invasionStartAt = 0
+        end
+
+        if not isInRaidArea() and not State.inRaid then
             local enemies = getAliveEnemies()
             if #enemies == 0 then
                 local raid = State.selectedRaid
                 print("[AF] In lobby, starting " .. raid.display .. "...")
+                if raid.raidType == "invasion" then
+                    State.invasionStartAt = tick()
+                end
 
                 if State.autoEquipBestPet then
                     equipBestWarriors()
@@ -725,8 +858,9 @@ local function raidCycleLoop()
                 end
 
                 if raid.raidType == "invasion" then
-                    -- Step 1: Press E ONCE (small radius to avoid wrong NPC)
+                    -- Step 1: Press E near the NPC, then use GUI fallback if the prompt UI is present.
                     local _, myHRP = getChar()
+                    local pressedPrompt = false
                     if myHRP then
                         for _, desc in ipairs(Workspace:GetDescendants()) do
                             if desc:IsA("ProximityPrompt") then
@@ -735,6 +869,7 @@ local function raidCycleLoop()
                                     local dist = (myHRP.Position - part.Position).Magnitude
                                     if dist < 10 then
                                         pcall(function() fireproximityprompt(desc) end)
+                                        pressedPrompt = true
                                         print("[AF] Pressed E (dist=" .. math.floor(dist) .. ")")
                                         break
                                     end
@@ -742,6 +877,7 @@ local function raidCycleLoop()
                             end
                         end
                     end
+                    if not pressedPrompt then pressE() end
 
                     -- Step 2: Wait up to 5s for dialog, do NOT press E again
                     local foundLead = false
@@ -761,8 +897,10 @@ local function raidCycleLoop()
                     -- Step 3: Click "Lead me to the invasion"
                     if foundLead then
                         task.wait(0.3)
-                        clickByText("lead me to the invasion")
-                        print("[AF] Clicked Lead me!")
+                        if not clickLeadToInvasion() then
+                            print("[AF] Lead me button was visible but click failed, retrying...")
+                            continue
+                        end
                         task.wait(2)
                     else
                         print("[AF] Dialog didn't appear, retrying...")
@@ -842,9 +980,16 @@ local function raidCycleLoop()
 
                     if State.autoEquipWeapon then equipWeapon() end
                     State.inRaid = true
+                    State.invasionStartAt = 0
+                    if raid.raidType == "invasion" then moveToInvasionHold("started") end
                     print("[AF] Farming started!")
                 else
-                    print("[AF] Failed to enter raid, retrying...")
+                    if raid.raidType == "invasion" then
+                        State.inRaid = false
+                        print("[AF] Invasion did not start in 20 seconds; retrying from bald hero...")
+                    else
+                        print("[AF] Failed to enter raid, retrying...")
+                    end
                 end
             end
         end
@@ -886,28 +1031,27 @@ local function victoryLoop()
             local rewardText = State.webhookRewards and getVictoryRewards() or "Completed."
 
             if raid.raidType == "invasion" then
-                -- INVASION: Click Replay to restart immediately
-                print("[AF] Clicking Replay...")
-                local replayed = false
+                -- INVASION: Click Continue, then let the normal cycle go back to bald hero and restart.
+                print("[AF] Clicking Continue after invasion...")
+                local continued = false
                 for attempt = 1, 5 do
-                    if clickExact("Replay") then
-                        replayed = true
+                    if clickExact("Continue") then
+                        continued = true
                         break
                     end
                     task.wait(1)
                 end
-
-                -- Also fire remote directly as backup
-                if not replayed then
-                    replayInvasion()
+                if not continued then
+                    clickByText("continue")
                 end
 
-                State.inRaid = true
-                State.replayGraceUntil = tick() + 90
                 sendWebhook("Invasion finished", rewardText, 5763719)
-                task.wait(3)
-                -- After replay we stay in raid flow; the game teleports us into the next run.
-                print("[AF] Replaying invasion, continuing farm!")
+                task.wait(2)
+                State.inRaid = false
+                State.invasionStartAt = 0
+                State.lastModifierSignature = ""
+                State.modifierPickedForSignature = false
+                print("[AF] Invasion continued; returning to bald hero for fresh start.")
 
             else
                 -- BOSS RAID: Click Continue then leaveRaid
@@ -933,12 +1077,8 @@ local function victoryLoop()
 
         -- Backup: detect teleport back to lobby
         if State.inRaid and not isInRaidArea() then
-            if State.selectedRaid.raidType == "invasion" and tick() < (State.replayGraceUntil or 0) then
-                print("[AF] Invasion replay transition detected; staying in raid mode")
-            else
-                print("[AF] Returned to lobby (teleport detected)")
-                State.inRaid = false
-            end
+            print("[AF] Returned to lobby (teleport detected)")
+            State.inRaid = false
         end
     end
 end
@@ -1078,7 +1218,7 @@ tt.TextSize = 16; tt.Font = Enum.Font.GothamBold; tt.TextXAlignment = Enum.TextX
 local verBadge = Instance.new("TextLabel", titleBar)
 verBadge.Size = UDim2.new(0, 22, 0, 14); verBadge.Position = UDim2.new(0, 102, 0.5, -7)
 verBadge.BackgroundColor3 = C.accent1; verBadge.BackgroundTransparency = 0.7
-verBadge.Text = "v5"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
+verBadge.Text = "v9"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
 verBadge.TextSize = 9; verBadge.Font = Enum.Font.GothamBold; verBadge.BorderSizePixel = 0; verBadge.ZIndex = 53
 Instance.new("UICorner", verBadge).CornerRadius = UDim.new(0, 4)
 
@@ -1261,4 +1401,170 @@ local function textBox(label, stateKey, placeholder, color)
     h.BorderSizePixel = 0; h.LayoutOrder = nxt(); h.ZIndex = 51
     Instance.new("UICorner", h).CornerRadius = UDim.new(0, 10)
     local hStroke = Instance.new("UIStroke", h)
-    hStroke.Color = C.border; hStroke.Thickness = 1; hStro... (8 KB left)
+    hStroke.Color = C.border; hStroke.Thickness = 1; hStroke.Transparency = 0.55
+
+    local l = Instance.new("TextLabel", h); l.Size = UDim2.new(1,-14,0,14); l.Position = UDim2.new(0,12,0,5)
+    l.BackgroundTransparency = 1; l.Text = label; l.TextColor3 = color or C.textDim
+    l.TextSize = 9; l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left; l.ZIndex = 52
+
+    local b = Instance.new("TextBox", h); b.Size = UDim2.new(1,-16,0,26); b.Position = UDim2.new(0,8,0,22)
+    b.BackgroundColor3 = Color3.fromRGB(40, 40, 56); b.BorderSizePixel = 0; b.ZIndex = 52
+    b.Text = State[stateKey] or ""; b.PlaceholderText = placeholder or ""; b.ClearTextOnFocus = false
+    b.TextColor3 = C.text; b.PlaceholderColor3 = C.textDim; b.TextSize = 11; b.Font = Enum.Font.Gotham
+    b.TextXAlignment = Enum.TextXAlignment.Left
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+    b.FocusLost:Connect(function()
+        State[stateKey] = trimText(b.Text)
+        print("[AF] Updated " .. label)
+    end)
+end
+
+-- Info panel with left accent bar
+local function info(lines)
+    local totalH = 8 + #lines * 16
+    local h = Instance.new("Frame", sc); h.Size = UDim2.new(1,0,0,totalH)
+    h.BackgroundColor3 = Color3.fromRGB(22, 22, 38); h.BorderSizePixel = 0; h.LayoutOrder = nxt(); h.ZIndex = 51
+    Instance.new("UICorner", h).CornerRadius = UDim.new(0, 8)
+    -- Left accent bar
+    local bar = Instance.new("Frame", h); bar.Size = UDim2.new(0,3,0.7,0); bar.Position = UDim2.new(0,0,0.15,0)
+    bar.BackgroundColor3 = C.accent1; bar.BorderSizePixel = 0; bar.ZIndex = 52
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(1,0)
+
+    for i, ln in ipairs(lines) do
+        local lb = Instance.new("TextLabel", h); lb.Size = UDim2.new(1,-18,0,14)
+        lb.Position = UDim2.new(0,12,0,3+(i-1)*16); lb.BackgroundTransparency = 1
+        lb.Text = ln.t; lb.TextColor3 = ln.c or C.textDim; lb.TextSize = 10
+        lb.Font = Enum.Font.Gotham; lb.TextXAlignment = Enum.TextXAlignment.Left; lb.TextWrapped = true; lb.ZIndex = 52
+    end
+end
+
+-- Status bar with background
+local statusHolder = Instance.new("Frame", sc)
+statusHolder.Size = UDim2.new(1,0,0,28); statusHolder.BackgroundColor3 = C.bgCard
+statusHolder.BorderSizePixel = 0; statusHolder.LayoutOrder = 999; statusHolder.ZIndex = 51
+Instance.new("UICorner", statusHolder).CornerRadius = UDim.new(0, 8)
+local statusDot = Instance.new("Frame", statusHolder)
+statusDot.Size = UDim2.new(0,6,0,6); statusDot.Position = UDim2.new(0,10,0.5,-3)
+statusDot.BackgroundColor3 = C.textDim; statusDot.BorderSizePixel = 0; statusDot.ZIndex = 52
+Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1,0)
+local statusBar = Instance.new("TextLabel", statusHolder)
+statusBar.Size = UDim2.new(1,-24,1,0); statusBar.Position = UDim2.new(0,22,0,0)
+statusBar.BackgroundTransparency = 1
+statusBar.Text = "Idle"; statusBar.TextColor3 = C.textDim
+statusBar.TextSize = 10; statusBar.Font = Enum.Font.Gotham
+statusBar.TextXAlignment = Enum.TextXAlignment.Left; statusBar.ZIndex = 52
+
+-- =============================================
+--  LAYOUT
+-- =============================================
+
+sec("Combat", C.accent5)
+tog("Auto equip weapon", "autoEquipWeapon", C.accent5)
+tog("Auto use weapon", "autoUseWeapon", C.accent5)
+tog("Auto claim achievement", "autoClaimAchievement", C.accent5)
+
+sec("Raid Selection", C.accent4)
+
+local raidNames = {}
+for _, r in ipairs(RaidList) do table.insert(raidNames, r.display) end
+drop("Select raid", raidNames, RaidList[1].display, function(idx)
+    State.selectedRaid = RaidList[idx]
+    print("[AF] Selected: " .. State.selectedRaid.display .. " (" .. State.selectedRaid.name .. ")")
+end, {C.accent3, C.accent1})  -- amber dot for Sunshine, purple for Dark Matter
+
+info({
+    {t = "Sunshine Lake — boss raid, auto leave", c = C.accent3},
+    {t = "Dark Matter — invasion, continue + restart", c = C.accent1},
+    {t = "Remotes loaded: " .. rc, c = C.green},
+})
+
+sec("Webhook", C.accent2)
+tog("Webhook enabled", "webhookEnabled", C.accent2)
+textBox("Webhook URL", "webhookUrl", "https://discord.com/api/webhooks/...", C.accent2)
+tog("Include rewards", "webhookRewards", C.accent3)
+
+sec("Modifier Priority", C.accent1)
+tog("Auto pick modifiers", "autoPickModifiers", C.accent1)
+for i = 1, 5 do
+    local default = State.modifierPriorities[i] or ModifierOptions[1]
+    drop("Priority " .. i, ModifierOptions, default, function(_, opt)
+        State.modifierPriorities[i] = opt
+        print("[AF] Modifier priority " .. i .. ": " .. opt)
+    end, {C.textDim, C.accent4, C.accent3, C.accent1, C.accent2, C.accent5})
+end
+info({
+    {t = "Turn Auto pick modifiers on for invasion cards", c = C.accent1},
+    {t = "Priority 1 is picked first when visible", c = C.accent1},
+    {t = "Add missing modifier names to ModifierOptions", c = C.textMid},
+})
+
+sec("Farm Controls", C.green)
+tog("Auto farm", "autoFarm", C.green)
+tog("Friend only", "friendOnly", C.accent3)
+tog("Auto create raid", "autoCreateRaid", C.accent2)
+
+sec("Warriors", C.accent2)
+tog("Auto equip best", "autoEquipBestPet", C.accent2)
+
+-- =============================================
+--  START LOOPS
+-- =============================================
+
+task.spawn(farmLoop)
+task.spawn(raidCycleLoop)
+task.spawn(victoryLoop)
+task.spawn(utilityLoop)
+
+-- Status updater
+task.spawn(function()
+    while State.running do
+        task.wait(1)
+        if State.autoFarm then
+            local enemies = getAliveEnemies()
+            local inRaid = isInRaidArea()
+
+            if inRaid then
+                if #enemies > 0 then
+                    statusBar.Text = "Killing " .. #enemies .. " enemies"
+                    statusBar.TextColor3 = C.accent4
+                    statusDot.BackgroundColor3 = C.accent4
+                else
+                    statusBar.Text = "Boss phase — swinging"
+                    statusBar.TextColor3 = C.accent1
+                    statusDot.BackgroundColor3 = C.accent1
+                end
+            else
+                if State.autoCreateRaid then
+                    statusBar.Text = "Lobby — creating " .. State.selectedRaid.display
+                    statusBar.TextColor3 = C.accent2
+                    statusDot.BackgroundColor3 = C.accent2
+                else
+                    statusBar.Text = "Lobby — waiting"
+                    statusBar.TextColor3 = C.textDim
+                    statusDot.BackgroundColor3 = C.textDim
+                end
+            end
+        else
+            statusBar.Text = "Idle — turn on Auto Farm"
+            statusBar.TextColor3 = C.textDim
+            statusDot.BackgroundColor3 = C.textDim
+        end
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    task.wait(2)
+    if State.autoEquipWeapon then equipWeapon() end
+    if State.autoEquipBestPet then equipBestWarriors() end
+end)
+
+print("===========================================")
+print("  Auto Farm v9 loaded!")
+print("  Sunshine Lake: bossRaid (leaveRaid)")
+print("  Dark Matter: invasion (continue + restart)")
+print("  Universal enemy detection")
+print("  Priority modifier voting once per card set")
+print("  Invasion restart uses Continue, no Replay remote")
+print("  Lead me dialog click retry improved")
+print("  Discord webhook notifications")
+print("===========================================")
