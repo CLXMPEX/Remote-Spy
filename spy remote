@@ -22,6 +22,8 @@ local player = Players.LocalPlayer
 local pgui   = player:WaitForChild("PlayerGui", 10)
 
 local RAID_Y_MIN = 5000
+local HIT_RANGE  = 700   -- only teleport to / attack enemies within this many studs
+local RAID_START_POS = CFrame.new(5048.5, 6019.0, -85.8)  -- teleport here on entry, then farm
 
 -- ============================================================
 --  REMOTES  (flat dotted names — confirmed by diagnostics)
@@ -102,6 +104,7 @@ local defaults = {
     webhookUrl           = "",
     webhookRewards       = true,
     autoPickModifiers    = true,
+    autoDig              = false,
     runCount             = 0,
     freezeUntil          = 0,
     lastModifierSignature = "",
@@ -118,6 +121,10 @@ local defaults = {
 for k, v in pairs(defaults) do
     if State[k] == nil then State[k] = v end
 end
+
+-- Always show the GUI on a fresh load, even if a previous session left it
+-- hidden (otherwise the window appears to "not show up").
+State.guiVisible = true
 
 local ModifierOptions = {
     "Disabled",
@@ -222,7 +229,7 @@ end
 local function attackTarget(target)
     local _, hrp = getChar()
     if hrp and target.hrp then
-        hrp.CFrame = target.hrp.CFrame * CFrame.new(0, 0, 5)
+        hrp.CFrame = target.hrp.CFrame * CFrame.new(0, 0, 1)
     end
     task.wait(0.05); swingWeapon()
     task.wait(0.05); hitEnemy(target.uuid)
@@ -382,7 +389,7 @@ end
 
 
 -- ============================================================
---  CLICK HELPERS  (for Replay button + modifier cards)
+--  CLICK HELPERS  (for Continue button + modifier cards)
 --  Uses the label-to-button walk that we proved reaches the
 --  game's empty-text buttons via the 'inner' frame.
 -- ============================================================
@@ -421,7 +428,7 @@ local function clickByText(searchText)
     return false
 end
 
--- click a label whose text EXACTLY matches (used for Replay)
+-- click a label whose text EXACTLY matches (used for Continue)
 local function clickExact(exactText)
     local afGui = pgui:FindFirstChild("AutoFarmGUI")
     for _, obj in ipairs(pgui:GetDescendants()) do
@@ -601,17 +608,29 @@ local function farmLoop()
         if State.autoEquipWeapon then equipWeapon() end
 
         local enemies = getAliveEnemies()
-        if #enemies > 0 then
-            local _, myHRP = getChar()
-            if myHRP then
-                table.sort(enemies, function(a, b)
-                    return (myHRP.Position - a.hrp.Position).Magnitude
-                         < (myHRP.Position - b.hrp.Position).Magnitude
-                end)
+        local _, myHRP = getChar()
+
+        -- Only consider enemies within HIT_RANGE studs. Anything farther is
+        -- ignored so we never teleport across the whole map for a distant one.
+        local inRange = {}
+        if myHRP then
+            for _, e in ipairs(enemies) do
+                if (myHRP.Position - e.hrp.Position).Magnitude <= HIT_RANGE then
+                    table.insert(inRange, e)
+                end
             end
-            attackTarget(enemies[1])
+        end
+
+        if #inRange > 0 then
+            -- closest in-range enemy first
+            table.sort(inRange, function(a, b)
+                return (myHRP.Position - a.hrp.Position).Magnitude
+                     < (myHRP.Position - b.hrp.Position).Magnitude
+            end)
+            attackTarget(inRange[1])
         else
-            -- between waves / on boss: stand and swing (no fly-around)
+            -- no enemy within 300 studs (between waves / on boss / far):
+            -- stand and swing in place (no fly-around).
             swingWeapon(); task.wait(0.1); swingWeapon()
         end
     end
@@ -651,6 +670,15 @@ local function raidCycleLoop()
                 -- (Leave / Start / Kick bar) so the waves actually begin.
                 pressInRaidStart()
                 if State.autoEquipWeapon then equipWeapon() end
+
+                -- Teleport to your chosen in-raid start spot once, then the
+                -- farm loop takes over attacking from there.
+                local _, hrp = getChar()
+                if hrp then
+                    hrp.CFrame = RAID_START_POS
+                    print("[AF] Teleported to raid start position")
+                end
+
                 State.inRaid = true
                 State.freezeUntil = tick() + 3
                 print("[AF] Farming started!")
@@ -660,7 +688,7 @@ local function raidCycleLoop()
 end
 
 -- ============================================================
---  VICTORY LOOP  (modifier voting + completion webhook + replay)
+--  VICTORY LOOP  (modifier voting + completion webhook + continue/restart)
 -- ============================================================
 local function victoryLoop()
     while State.running do
@@ -691,7 +719,7 @@ local function victoryLoop()
             print("[AF] Victory! Run #" .. State.runCount)
             task.wait(3)
 
-            -- scrape drops BEFORE clicking replay (screen wipes after)
+            -- scrape drops BEFORE leaving (screen wipes after Continue)
             local dropsText = State.webhookRewards and getVictoryDrops() or "Rewards hidden"
             sendWebhook(
                 "Invasion Complete - Run #" .. State.runCount,
@@ -700,32 +728,33 @@ local function victoryLoop()
                 { { name = "Drops", value = dropsText, inline = false } }
             )
 
-            -- freeze, then press Replay
-            State.freezeUntil = tick() + 12
-            print("[AF] Clicking Replay...")
-            local replayed = false
+            -- Freeze briefly so combat stops, then press CONTINUE (not Replay).
+            -- Continue leaves the raid back to the lobby; from there the raid
+            -- cycle starts a FRESH invasion via the remote. Replay was glitchy,
+            -- so we avoid it entirely.
+            State.freezeUntil = tick() + 8
+            print("[AF] Clicking Continue...")
+            local continued = false
             for _ = 1, 6 do
-                if clickExact("Replay") then replayed = true; break end
+                if clickExact("Continue") then continued = true; break end
                 task.wait(1)
             end
-            if not replayed then clickByText("replay") end
+            if not continued then clickByText("continue") end
 
-            State.freezeUntil = tick() + 12
-
-            -- after replay, press in-raid Start so waves begin
-            task.wait(3)
-            for _ = 1, 10 do
-                if #getAliveEnemies() > 0 then break end
-                clickExact("Start")
-                clickByText("start")
-                if R.lobbyStart then pcall(function() R.lobbyStart:FireServer() end) end
+            -- Wait until we're actually out of the raid (back in lobby).
+            local waited = 0
+            while isInRaidArea() and waited < 12 do
+                clickByText("continue")
                 task.wait(1)
+                waited = waited + 1
             end
 
-            State.freezeUntil = tick() + 3
+            -- Mark out-of-raid so raidCycleLoop will start a new invasion.
+            State.inRaid = false
+            State.freezeUntil = 0
             State.lastModifierSignature = ""
             State.modifierPickedForSignature = false
-            print("[AF] Replayed; continuing farm.")
+            print("[AF] Continued to lobby; starting a fresh invasion.")
         end
     end
 end
@@ -747,15 +776,297 @@ end
 print("[AF v11] loops loaded")
 
 -- ============================================================
+--  AUTO DIGGER  (treasure hunt) — own log window, toggled by
+--  State.autoDig. Runs independently of invasion farming.
+-- ============================================================
+do
+    -- its own ScreenGui (separate from the main AF GUI)
+    local oldDig = pgui:FindFirstChild("TH_Explorer")
+    if oldDig then oldDig:Destroy() end
+
+    local dsg = Instance.new("ScreenGui")
+    dsg.Name = "TH_Explorer"
+    dsg.ResetOnSpawn = false
+    dsg.DisplayOrder = 9998
+    dsg.Parent = pgui
+
+    -- copy-log button
+    local bigCopy = Instance.new("TextButton")
+    bigCopy.Size = UDim2.new(0, 130, 0, 36)
+    bigCopy.Position = UDim2.new(0, 10, 0, 6)
+    bigCopy.BackgroundColor3 = Color3.fromRGB(0, 170, 80)
+    bigCopy.Text = "COPY DIG LOG"
+    bigCopy.TextColor3 = Color3.fromRGB(255, 255, 255)
+    bigCopy.TextSize = 13
+    bigCopy.Font = Enum.Font.GothamBold
+    bigCopy.BorderSizePixel = 0
+    bigCopy.ZIndex = 100
+    bigCopy.Parent = dsg
+    Instance.new("UICorner", bigCopy).CornerRadius = UDim.new(0, 8)
+
+    -- status pill
+    local statusBtn = Instance.new("TextButton")
+    statusBtn.Size = UDim2.new(0, 130, 0, 26)
+    statusBtn.Position = UDim2.new(0, 10, 0, 46)
+    statusBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+    statusBtn.Text = "Digger off"
+    statusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    statusBtn.TextSize = 11
+    statusBtn.Font = Enum.Font.GothamBold
+    statusBtn.BorderSizePixel = 0
+    statusBtn.Active = false
+    statusBtn.ZIndex = 100
+    statusBtn.Parent = dsg
+    Instance.new("UICorner", statusBtn).CornerRadius = UDim.new(0, 6)
+
+    -- log window
+    local win = Instance.new("Frame")
+    win.Size = UDim2.new(0, 260, 0, 200)
+    win.Position = UDim2.new(0, 10, 0, 80)
+    win.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+    win.BackgroundTransparency = 0.05
+    win.BorderSizePixel = 0
+    win.Active = true
+    win.Draggable = true
+    win.ClipsDescendants = true
+    win.ZIndex = 99
+    win.Parent = dsg
+    Instance.new("UICorner", win).CornerRadius = UDim.new(0, 8)
+    local dstroke = Instance.new("UIStroke", win)
+    dstroke.Color = Color3.fromRGB(0, 170, 80); dstroke.Thickness = 1
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 26, 0, 26)
+    closeBtn.Position = UDim2.new(1, -28, 0, 2)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    closeBtn.Text = "X"
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.TextSize = 13
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.ZIndex = 101
+    closeBtn.Parent = win
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+    -- closing only hides the digger window; the toggle still controls digging
+    closeBtn.MouseButton1Click:Connect(function() win.Visible = false end)
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -8, 1, -8)
+    scroll.Position = UDim2.new(0, 4, 0, 4)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 5
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 80)
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ZIndex = 99
+    scroll.Parent = win
+
+    local output = Instance.new("TextLabel")
+    output.Size = UDim2.new(1, -8, 0, 0)
+    output.Position = UDim2.new(0, 4, 0, 0)
+    output.AutomaticSize = Enum.AutomaticSize.Y
+    output.BackgroundTransparency = 1
+    output.Text = ""
+    output.TextColor3 = Color3.fromRGB(0, 255, 120)
+    output.TextSize = 10
+    output.Font = Enum.Font.Code
+    output.TextXAlignment = Enum.TextXAlignment.Left
+    output.TextYAlignment = Enum.TextYAlignment.Top
+    output.TextWrapped = true
+    output.ZIndex = 99
+    output.Parent = scroll
+
+    local logText = ""
+    local function dlog(msg)
+        logText = logText .. msg .. "\n"
+        if #logText > 8000 then logText = logText:sub(#logText - 6000) end
+        output.Text = logText
+    end
+
+    bigCopy.MouseButton1Click:Connect(function()
+        local clip = setclipboard or toclipboard or set_clipboard or (syn and syn.write_clipboard)
+        if clip then
+            pcall(function() clip(logText) end)
+            bigCopy.Text = "COPIED!"
+            bigCopy.BackgroundColor3 = Color3.fromRGB(0, 110, 200)
+            task.delay(1.5, function()
+                bigCopy.Text = "COPY DIG LOG"
+                bigCopy.BackgroundColor3 = Color3.fromRGB(0, 170, 80)
+            end)
+        end
+    end)
+
+    -- safe value stringify (from the original)
+    local function safeStr(v, depth)
+        depth = depth or 0
+        if depth > 3 then return "..." end
+        if typeof(v) == "string" then return '"' .. v .. '"' end
+        if typeof(v) == "number" or typeof(v) == "boolean" then return tostring(v) end
+        if v == nil then return "nil" end
+        if typeof(v) == "table" then
+            local parts, count = {}, 0
+            for k2, v2 in pairs(v) do
+                count = count + 1
+                if count > 15 then table.insert(parts, "..."); break end
+                table.insert(parts, tostring(k2) .. "=" .. safeStr(v2, depth + 1))
+            end
+            return "{" .. table.concat(parts, ", ") .. "}"
+        end
+        return typeof(v) .. ":" .. tostring(v)
+    end
+
+    -- digger worker
+    task.spawn(function()
+        local RS = game:GetService("ReplicatedStorage")
+
+        -- find dig remote
+        local digRemote
+        for _, desc in pairs(RS:GetDescendants()) do
+            if desc.Name == "treasureHunt.dig" then digRemote = desc; break end
+        end
+        -- load atoms (player data store)
+        local atoms
+        for _, desc in pairs(RS:GetDescendants()) do
+            if desc:IsA("ModuleScript") and desc.Name == "atoms"
+               and desc:GetFullName():find("common.store.atoms") then
+                pcall(function() atoms = require(desc) end)
+                break
+            end
+        end
+
+        if not digRemote or not atoms then
+            dlog("=== DIGGER: setup failed ===")
+            if not digRemote then dlog("  no treasureHunt.dig remote") end
+            if not atoms then dlog("  no atoms module") end
+            statusBtn.Text = "Digger: setup fail"
+            statusBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+            return
+        end
+
+        local function getData()
+            local atomTable = atoms.atoms or atoms
+            if not atomTable.datastore or typeof(atomTable.datastore) ~= "function" then return nil end
+            local ok, ds = pcall(atomTable.datastore)
+            if not ok or typeof(ds) ~= "table" then return nil end
+            return ds[tostring(player.UserId)] or ds[player.UserId]
+        end
+
+        dlog("=== AUTO DIGGER ready (toggle in AF GUI) ===")
+        local totalDug = 0
+
+        while dsg.Parent do
+            -- only dig when the toggle is on
+            if not State.autoDig then
+                statusBtn.Text = "Digger off"
+                statusBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+                task.wait(1)
+                continue
+            end
+
+            local pdata = getData()
+            if not pdata then task.wait(3); continue end
+
+            local shovels = 0
+            if pdata.items and pdata.items.Shovel then
+                shovels = pdata.items.Shovel.amount or 0
+            end
+
+            local dugTiles, currentTier = {}, 0
+            if pdata.treasureHunt then
+                currentTier = pdata.treasureHunt.currentTier or 0
+                if pdata.treasureHunt.dug then
+                    for _, tile in pairs(pdata.treasureHunt.dug) do
+                        if tile.index then dugTiles[tile.index] = true end
+                    end
+                end
+            end
+
+            if shovels > 0 then
+                local undug = {}
+                for i = 1, 49 do
+                    if not dugTiles[i] then table.insert(undug, i) end
+                end
+
+                if #undug == 0 then
+                    statusBtn.Text = "Tier " .. currentTier .. " done!"
+                    statusBtn.BackgroundColor3 = Color3.fromRGB(200, 160, 0)
+                    task.wait(5)
+                    continue
+                end
+
+                dlog("Shovels: " .. shovels .. " | Undug: " .. #undug)
+                statusBtn.Text = "DIGGING " .. shovels .. " shovels"
+                statusBtn.BackgroundColor3 = Color3.fromRGB(200, 120, 0)
+
+                for _, tileIdx in ipairs(undug) do
+                    if not dsg.Parent then return end
+                    if not State.autoDig then break end  -- stop mid-batch if toggled off
+
+                    local freshData = getData()
+                    local freshShovels = 0
+                    if freshData and freshData.items and freshData.items.Shovel then
+                        freshShovels = freshData.items.Shovel.amount or 0
+                    end
+                    if freshShovels <= 0 then dlog("  out of shovels"); break end
+
+                    local ok, result = pcall(function()
+                        return digRemote:InvokeServer(tileIdx)
+                    end)
+
+                    if ok and typeof(result) == "table" then
+                        if result.reason then
+                            dlog("  Tile " .. tileIdx .. ": SKIP (" .. tostring(result.reason) .. ")")
+                        elseif result.revealed then
+                            totalDug = totalDug + 1
+                            local rewardStr = ""
+                            for _, rev in pairs(result.revealed) do
+                                if rev.reward then
+                                    rewardStr = tostring(rev.reward.id or "") .. " x" .. tostring(rev.reward.amount or "")
+                                end
+                            end
+                            local sLeft = result.shovels or "?"
+                            local tierStr = result.tierComplete and " [TIER DONE!]" or ""
+                            dlog("  Tile " .. tileIdx .. ": " .. rewardStr
+                                 .. " (left: " .. tostring(sLeft) .. ")" .. tierStr)
+                            statusBtn.Text = "Dug " .. totalDug .. " | " .. rewardStr
+                        else
+                            dlog("  Tile " .. tileIdx .. ": " .. safeStr(result))
+                        end
+                    elseif not ok then
+                        dlog("  Tile " .. tileIdx .. " ERR: " .. tostring(result):sub(1, 50))
+                    end
+
+                    task.wait(0.3)
+                end
+
+                dlog("  batch done; waiting for shovels")
+            else
+                statusBtn.Text = "Waiting (dug " .. totalDug .. ")"
+                statusBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+            end
+
+            task.wait(3)
+        end
+    end)
+end
+
+print("[AF v11] auto-digger loaded")
+
+-- ============================================================
 --  GUI  (landscape / wide layout, button for everything)
 -- ============================================================
 local oldGui = pgui:FindFirstChild("AutoFarmGUI")
 if oldGui then oldGui:Destroy() end
 
-local sg = Instance.new("ScreenGui", pgui)
+print("[AF v11] building GUI...")
+
+local sg = Instance.new("ScreenGui")
 sg.Name = "AutoFarmGUI"
 sg.ResetOnSpawn = false
 sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.IgnoreGuiInset = true
+sg.DisplayOrder = 9999
+sg.Parent = pgui
 
 local C = {
     bg      = Color3.fromRGB(16, 16, 22),
@@ -1175,6 +1486,9 @@ tog(leftCol, "Auto start invasion", "autoCreateRaid", C.accent2)
 
 sec(leftCol, "Warriors", C.accent2)
 tog(leftCol, "Auto equip best",  "autoEquipBestPet", C.accent2)
+
+sec(leftCol, "Treasure", C.accent3)
+tog(leftCol, "Auto dig", "autoDig", C.accent3)
 
 -- ============================================================
 --  LAYOUT — RIGHT COLUMN: Webhook, Modifier Priority
